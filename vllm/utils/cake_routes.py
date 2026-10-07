@@ -19,6 +19,7 @@ Routes:
   produce (``vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn``).
 """
 
+import importlib
 from typing import NamedTuple
 
 import torch
@@ -107,7 +108,7 @@ def cake_gdn_prefill_admission(
     if compute_capability is None:
         return CakeGDNPrefillAdmission(False, "unknown device capability", ())
     try:
-        from flashinfer.jit import cake_gdn
+        cake_gdn = importlib.import_module("flashinfer.jit.cake_gdn")
     except ImportError as exc:
         return CakeGDNPrefillAdmission(
             False, f"flashinfer.jit.cake_gdn is not importable: {exc}", ()
