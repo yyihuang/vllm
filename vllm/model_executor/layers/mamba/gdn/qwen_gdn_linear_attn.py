@@ -59,6 +59,8 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.utils.cake_routes import GDN_PREFILL_ROUTE, cake_route_enabled
+from vllm.utils.flashinfer import has_flashinfer_cake_gdn_prefill
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -197,6 +199,7 @@ def fi_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = True,
+    backend: str = "flashinfer",
 ):
     from flashinfer.gdn_prefill import (
         chunk_gated_delta_rule as chunk_gated_delta_rule_fi,
@@ -227,7 +230,7 @@ def fi_chunk_gated_delta_rule(
         initial_state=fi_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        backend="flashinfer",
+        backend=backend,
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.
@@ -254,6 +257,27 @@ class ChunkGatedDeltaRule(CustomOp):
                 backend,
             )
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
+
+        # Opt-in Cake GDN prefill (VLLM_CAKE_ROUTES=gdn_prefill): the same
+        # FlashInfer entry point with backend="cake_gdn". Decided once here;
+        # only reachable where the FlashInfer GDN prefill backend is active.
+        self.fi_prefill_backend = "flashinfer"
+        if cake_route_enabled(GDN_PREFILL_ROUTE):
+            admitted = (
+                active_backend == "flashinfer"
+                and current_platform.is_device_capability_family(100)
+                and has_flashinfer_cake_gdn_prefill()
+            )
+            if admitted:
+                self.fi_prefill_backend = "cake_gdn"
+            logger.info_once(
+                "Cake GDN prefill route %s (active GDN prefill backend %s, "
+                "SM100-family %s, FlashInfer Cake GDN prefill %s).",
+                "admitted" if admitted else "not admitted",
+                active_backend,
+                current_platform.is_device_capability_family(100),
+                has_flashinfer_cake_gdn_prefill(),
+            )
 
         if active_backend == "flashinfer":
             self._forward_method = self.forward_cuda
@@ -287,6 +311,7 @@ class ChunkGatedDeltaRule(CustomOp):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            backend=self.fi_prefill_backend,
         )
         if core_attn_out is not None:
             o_flat = o.squeeze(0).reshape(-1)
