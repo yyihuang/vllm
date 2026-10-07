@@ -13,8 +13,9 @@ import pytest
 import torch
 
 import vllm.envs as envs
+import vllm.model_executor.custom_op as custom_op_mod
 import vllm.utils.flashinfer as fi_utils
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import CompilationConfig
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn_mod
 from vllm.utils import cake_routes
 from vllm.utils.cake_routes import (
@@ -264,11 +265,12 @@ def test_admission_rejects_contracts_outside_the_cake_kernels(
 
 
 def test_admission_reports_a_missing_cake_module(monkeypatch):
+    # A FlashInfer whose ``jit`` package has no ``cake_gdn`` module at all.
+    jit: Any = types.ModuleType("flashinfer.jit")
+    jit.__path__ = []
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
-    monkeypatch.setitem(
-        sys.modules, "flashinfer.jit", types.ModuleType("flashinfer.jit")
-    )
-    monkeypatch.setitem(sys.modules, "flashinfer.jit.cake_gdn", None)
+    monkeypatch.setitem(sys.modules, "flashinfer.jit", jit)
+    monkeypatch.delitem(sys.modules, "flashinfer.jit.cake_gdn", raising=False)
     result = _admission()
     assert not result.admitted
     assert "flashinfer.jit.cake_gdn" in result.detail
@@ -312,9 +314,14 @@ def test_custom_op_decides_the_cake_backend_once(
         )
     )
     monkeypatch.setattr(gdn_mod, "cake_gdn_prefill_admission", probe)
+    # CustomOp.__init__ reads the compilation config; a bare one keeps the test
+    # independent of device inference (no VllmConfig(), no GPU needed).
+    compilation_config = CompilationConfig()
+    monkeypatch.setattr(
+        custom_op_mod, "get_cached_compilation_config", lambda: compilation_config
+    )
 
-    with set_current_vllm_config(VllmConfig()):
-        op = gdn_mod.ChunkGatedDeltaRule(**geometry)
+    op = gdn_mod.ChunkGatedDeltaRule(**geometry)
 
     assert op.gdn_prefill_backend == active
     assert op.fi_prefill_backend == expect
