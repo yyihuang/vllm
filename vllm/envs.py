@@ -1800,8 +1800,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
     ),
-    # Opt-in Cake-generated FlashInfer kernels (``backend="cake"``) by route
-    # name, comma-separated; see vllm/utils/cake_routes.py. Unset: no change.
+    # Opt-in Cake-generated FlashInfer kernels by route name, comma-separated;
+    # vllm/utils/cake_routes.py lists the routes and the FlashInfer backend each
+    # one selects. Unset: no change.
     "VLLM_CAKE_ROUTES": lambda: os.getenv("VLLM_CAKE_ROUTES", ""),
     # Transmit MoE all-to-all combine (expert-output) payloads in FP8 instead
     # of BF16, halving NVLink traffic on the combine leg. Only takes effect
