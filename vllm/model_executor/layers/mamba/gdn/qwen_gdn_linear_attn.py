@@ -59,7 +59,11 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.utils.cake_routes import GDN_PREFILL_ROUTE, cake_route_enabled
+from vllm.utils.cake_routes import (
+    GDN_PREFILL_ROUTE,
+    cake_gdn_prefill_admission,
+    cake_route_enabled,
+)
 from vllm.utils.flashinfer import has_flashinfer_cake_gdn_prefill
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -263,7 +267,12 @@ def fi_chunk_gated_delta_rule(
     fi_state = initial_state.to(torch.float32)
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
-    if cu_seqlens is not None:
+    # The Cake backend accepts int32 and resolves the sequence metadata on the
+    # host once per distinct cu_seqlens tensor, so vLLM's per-step tensor is
+    # passed through unchanged and every GDN layer of a step shares that
+    # resolution (a fresh copy per call would cost one device-to-host
+    # synchronization per layer).
+    if cu_seqlens is not None and backend != "cake_gdn":
         cu_seqlens = cu_seqlens.to(torch.int64)
     result = chunk_gated_delta_rule_fi(
         q=q,
@@ -288,7 +297,17 @@ def fi_chunk_gated_delta_rule(
 
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        num_k_heads: int | None = None,
+        num_v_heads: int | None = None,
+        head_k_dim: int | None = None,
+        head_v_dim: int | None = None,
+    ) -> None:
+        """``num_k_heads`` / ``num_v_heads`` are the layer's per-rank head counts;
+        together with the head dims they are only needed to admit the opt-in
+        Cake GDN prefill route."""
         super().__init__()
         vllm_config = get_current_vllm_config()
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
@@ -303,24 +322,21 @@ class ChunkGatedDeltaRule(CustomOp):
         _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
         # Opt-in Cake GDN prefill (VLLM_CAKE_ROUTES=gdn_prefill): the same
-        # FlashInfer entry point with backend="cake_gdn". Decided once here;
-        # only reachable where the FlashInfer GDN prefill backend is active.
+        # FlashInfer entry point with backend="cake_gdn". FlashInfer serves an
+        # explicit cake_gdn request only from its frozen manifest and raises
+        # otherwise, so the route is admitted once here, host-side, only when
+        # the manifest resolves this layer's per-rank head geometry for every
+        # batch the scheduler can produce; the default backend stays otherwise.
         self.fi_prefill_backend = "flashinfer"
+        self.cake_gdn_warmup_num_seqs: tuple[int, ...] = ()
         if cake_route_enabled(GDN_PREFILL_ROUTE):
-            admitted = (
-                active_backend == "flashinfer"
-                and current_platform.is_device_capability_family(100)
-                and has_flashinfer_cake_gdn_prefill()
-            )
-            if admitted:
-                self.fi_prefill_backend = "cake_gdn"
-            logger.info_once(
-                "Cake GDN prefill route %s (active GDN prefill backend %s, "
-                "SM100-family %s, FlashInfer Cake GDN prefill %s).",
-                "admitted" if admitted else "not admitted",
+            self._admit_cake_gdn_prefill(
+                vllm_config,
                 active_backend,
-                current_platform.is_device_capability_family(100),
-                has_flashinfer_cake_gdn_prefill(),
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
             )
 
         if active_backend == "flashinfer":
@@ -331,6 +347,49 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_aiter_flydsl
         else:
             self._forward_method = self.forward_native
+
+    def _admit_cake_gdn_prefill(
+        self,
+        vllm_config: VllmConfig,
+        active_backend: str,
+        *,
+        num_k_heads: int | None,
+        num_v_heads: int | None,
+        head_k_dim: int | None,
+        head_v_dim: int | None,
+    ) -> None:
+        if active_backend != "flashinfer":
+            detail = f"the active GDN prefill backend is {active_backend}"
+        elif None in (num_k_heads, num_v_heads, head_k_dim, head_v_dim):
+            detail = "the layer's per-rank head geometry was not provided"
+        elif not has_flashinfer_cake_gdn_prefill():
+            detail = (
+                "the installed FlashInfer has no buildable Cake GDN prefill backend"
+            )
+        else:
+            capability = current_platform.get_device_capability()
+            admission = cake_gdn_prefill_admission(
+                num_k_heads=num_k_heads,  # type: ignore[arg-type]
+                num_v_heads=num_v_heads,  # type: ignore[arg-type]
+                head_k_dim=head_k_dim,  # type: ignore[arg-type]
+                head_v_dim=head_v_dim,  # type: ignore[arg-type]
+                dtype=vllm_config.model_config.dtype,
+                compute_capability=(
+                    None if capability is None else (capability.major, capability.minor)
+                ),
+                max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+            )
+            detail = admission.detail
+            if admission.admitted:
+                self.fi_prefill_backend = "cake_gdn"
+                self.cake_gdn_warmup_num_seqs = admission.warmup_num_seqs
+        logger.info_once(
+            "Cake GDN prefill route %s for per-rank heads %s/%s: %s",
+            "admitted" if self.fi_prefill_backend == "cake_gdn" else "not admitted",
+            num_k_heads,
+            num_v_heads,
+            detail,
+        )
 
     def forward_cuda(
         self,
@@ -613,7 +672,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.out_proj",
         )
 
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(
+            num_k_heads=self.num_k_heads // self.tp_size,
+            num_v_heads=self.num_v_heads // self.tp_size,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+        )
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
@@ -1183,7 +1247,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         All kernels including ``chunk_fwd_kernel_o`` now use a fixed
         ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
+        is sufficient to populate the autotuner cache.  The Cake GDN prefill
+        route instead compiles one frozen FlashInfer variant per batch regime,
+        so it runs one pass per sequence count its admission resolved
+        (``ChunkGatedDeltaRule.cake_gdn_warmup_num_seqs``); FlashInfer compiles
+        and loads each variant on first use, which must not happen inside a
+        serving step.
 
         The decode path uses ``gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule``
         which has fixed kernel parameters (no autotuning), so only the
@@ -1193,22 +1262,57 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return
         self._prefill_kernels_warmed_up = True
 
+        cake_route = self.chunk_gated_delta_rule.fi_prefill_backend == "cake_gdn"
+        for num_seqs in self.chunk_gated_delta_rule.cake_gdn_warmup_num_seqs or (1,):
+            try:
+                self._warmup_prefill_pass(qkv_or_qkvz, v_dim, num_seqs)
+            except Exception as exc:
+                if cake_route:
+                    # An explicit Cake request has no fallback in FlashInfer:
+                    # fail at start-up rather than at the first prefill.
+                    raise RuntimeError(
+                        "Cake GDN prefill warmup failed for layer "
+                        f"{self.prefix} ({num_seqs} sequence(s) of "
+                        f"{FLA_CHUNK_SIZE} tokens)"
+                    ) from exc
+                logger.warning(
+                    "GDN prefill kernel warmup (T=%d) failed for "
+                    "layer %s. First inference may OOM due to "
+                    "autotuner.",
+                    FLA_CHUNK_SIZE,
+                    self.prefix,
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "GDN prefill kernel warmup (%d x T=%d) completed for layer %s",
+                    num_seqs,
+                    FLA_CHUNK_SIZE,
+                    self.prefix,
+                )
+
+        torch.accelerator.empty_cache()
+
+    def _warmup_prefill_pass(
+        self, qkv_or_qkvz: torch.Tensor, v_dim: int, num_seqs: int
+    ) -> None:
+        """One chunked-prefill pass over ``num_seqs`` sequences of ``T`` tokens,
+        mirroring the real prefill path: build q/k/v/g/beta via
+        ``fused_post_conv_prep`` and run ``chunk_gated_delta_rule`` with in-kernel
+        L2 norm disabled."""
         device = qkv_or_qkvz.device
         dtype = qkv_or_qkvz.dtype
         num_k_heads = self.num_k_heads // self.tp_size
         num_v_heads = self.num_v_heads // self.tp_size
         _, state_dtype = self.get_state_dtype()
 
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Mirror the real
-        # prefill path here: build q/k/v/g/beta via fused_post_conv_prep and
-        # then run chunk_gated_delta_rule with in-kernel L2 norm disabled.
         T = FLA_CHUNK_SIZE
+        tokens = T * num_seqs
         dummy_mixed_qkv = torch.randn(
-            T, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
+            tokens, qkv_or_qkvz.shape[-1] - v_dim, device=device, dtype=dtype
         )
-        dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
-        dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+        dummy_a = torch.randn(tokens, num_v_heads, device=device, dtype=dtype)
+        dummy_b = torch.randn(tokens, num_v_heads, device=device, dtype=dtype)
         q, k, v, g, beta = fused_post_conv_prep(
             conv_output=dummy_mixed_qkv,
             a=dummy_a,
@@ -1227,14 +1331,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
         state = torch.zeros(
-            1,
+            num_seqs,
             num_v_heads,
             self.head_v_dim,
             self.head_k_dim,
             device=device,
             dtype=state_dtype,
         )
-        cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+        cu_seqlens = torch.arange(0, tokens + 1, T, device=device, dtype=torch.int32)
 
         # CuteDSL kernels require metadata
         chunk_indices = None
@@ -1248,7 +1352,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
         elif self.gdn_prefill_backend == "aiter_flydsl":
             aiter_prefill_metadata = rocm_aiter_ops.build_gdn_flydsl_prefill_metadata(
-                [T],
+                [T] * num_seqs,
                 cu_seqlens=cu_seqlens,
             )
 
@@ -1267,21 +1371,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
                 aiter_prefill_metadata=aiter_prefill_metadata,
             )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
         finally:
             del (
                 dummy_mixed_qkv,
@@ -1298,8 +1387,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets,
                 aiter_prefill_metadata,
             )
-
-        torch.accelerator.empty_cache()
 
     def _forward_core_rocm(
         self,

@@ -510,10 +510,30 @@ def _gdn_prefill_offers_cake_backend(fn: Callable[..., Any]) -> bool:
     return "cake_gdn" in str(backend.annotation)
 
 
+def _cake_gdn_build_tools_missing() -> list[str]:
+    """The Cake GDN kernels are source-only: nvcc compiles the cubin and the host
+    binding is built with ninja and a C++ compiler, whether or not flashinfer-cubin
+    is installed."""
+    tools = (
+        ("nvcc", _flashinfer_nvcc_path()),
+        ("ninja", shutil.which("ninja")),
+        ("c++", shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")),
+    )
+    return [name for name, path in tools if path is None]
+
+
 @functools.cache
 def has_flashinfer_cake_gdn_prefill() -> bool:
-    """Return whether FlashInfer GDN prefill offers ``backend="cake_gdn"``."""
+    """Return whether FlashInfer GDN prefill offers ``backend="cake_gdn"`` and this
+    host can build it."""
     if not has_flashinfer():
+        return False
+    missing = _cake_gdn_build_tools_missing()
+    if missing:
+        logger.debug_once(
+            "FlashInfer Cake GDN prefill is unavailable: %s not found.",
+            ", ".join(missing),
+        )
         return False
     try:
         if importlib.util.find_spec("flashinfer.jit.cake_gdn") is None:
