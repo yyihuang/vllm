@@ -314,9 +314,11 @@ def test_custom_op_decides_the_cake_backend_once(
         )
     )
     monkeypatch.setattr(gdn_mod, "cake_gdn_prefill_admission", probe)
-    # CustomOp.__init__ reads the compilation config; a bare one keeps the test
-    # independent of device inference (no VllmConfig(), no GPU needed).
-    compilation_config = CompilationConfig()
+    # CustomOp.__init__ reads the compilation config: a bare one with the base
+    # mode VllmConfig would seed for the Inductor backend keeps the test
+    # independent of device inference (no VllmConfig(), no GPU needed). The
+    # Cake decision is made at init, before any forward is dispatched.
+    compilation_config = CompilationConfig(custom_ops=["none"])
     monkeypatch.setattr(
         custom_op_mod, "get_cached_compilation_config", lambda: compilation_config
     )
