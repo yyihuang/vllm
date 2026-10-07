@@ -490,6 +490,41 @@ def has_flashinfer_fused_kda_decode() -> bool:
     )
 
 
+def _gdn_prefill_offers_cake_backend(fn: Callable[..., Any]) -> bool:
+    """``chunk_gated_delta_rule`` takes ``backend`` and lists ``cake_gdn`` among
+    its choices, i.e. the FlashInfer build carries the Cake GDN prefill backend."""
+    import inspect
+    import typing
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    backend = params.get("backend")
+    if backend is None:
+        return False
+    choices = typing.get_args(backend.annotation)
+    if choices:
+        return "cake_gdn" in choices
+    # Deferred (string) annotations: fall back to a textual check.
+    return "cake_gdn" in str(backend.annotation)
+
+
+@functools.cache
+def has_flashinfer_cake_gdn_prefill() -> bool:
+    """Return whether FlashInfer GDN prefill offers ``backend="cake_gdn"``."""
+    if not has_flashinfer():
+        return False
+    try:
+        if importlib.util.find_spec("flashinfer.jit.cake_gdn") is None:
+            return False
+    except (ImportError, ValueError):
+        return False
+    mod = _get_submodule("flashinfer.gdn_prefill")
+    fn = getattr(mod, "chunk_gated_delta_rule", None)
+    return fn is not None and _gdn_prefill_offers_cake_backend(fn)
+
+
 @functools.cache
 def has_flashinfer_trtllm_fused_moe() -> bool:
     """Return `True` if FlashInfer TRTLLM fused MoE is available."""
@@ -1326,6 +1361,7 @@ __all__ = [
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_recurrent_kda",
     "has_flashinfer_fused_kda_decode",
+    "has_flashinfer_cake_gdn_prefill",
     "has_flashinfer_cutedsl_moe_nvfp4",
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
